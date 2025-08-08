@@ -12,6 +12,9 @@ using ChainRulesCore
 
 const causal_mask = Val(:causal_mask)
 
+include("conditional.jl")
+export ConditionalTransformer
+
 include("layers.jl")
 export FeedForward
 export RMSNorm
