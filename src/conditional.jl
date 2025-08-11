@@ -66,6 +66,7 @@ function (model::ConditionalTransformer)(tokens::AbstractArray{Int}, conditional
 end
 
 (model::ConditionalTransformer)(tokens::AbstractArray{Int}, conditional; kws...) = model(tokens, (conditional,); kws...)
+(model::ConditionalTransformer)(tokens::AbstractArray{Int}; kws...) = model(tokens, (); kws...)
 
 # compat
 forward_loss(model::ConditionalTransformer, inputs::AbstractArray, conditionals, targets::AbstractArray; loss_mask = nothing, kws...) = loss(model(inputs, conditionals; kws...), targets, loss_mask = loss_mask) 
