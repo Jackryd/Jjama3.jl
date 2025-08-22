@@ -48,13 +48,23 @@ end
 
 ### Model ###
 
+function default_conditional_mask(tokens, conditional_list)
+    mask = similar(tokens, size(tokens, 1), size(tokens, 2), length(conditional_list))
+    mask .= 1
+    return mask
+end
+
 function (model::ConditionalTransformer)(tokens::AbstractArray{Int}, conditionals::Tuple; 
-                                         conditional_list = 1:length(conditionals), caches = no_kv_cache(model), kws...)
+                                         conditional_list = 1:length(conditionals), conditional_mask_gen = default_conditional_mask, caches = no_kv_cache(model), kws...)
+    conditional_mask = Flux.ChainRulesCore.ignore_derivatives() do
+        conditional_mask_gen(tokens, conditional_list)
+    end # (seq_len, batch, length(conditional_list))
     h = model.tok_embeddings(tokens) # Embedding: (dim, seq_len, batch)
     for (ic, c) in enumerate(conditional_list)
         cond_emb = model.cond_embeddings[c]
-        cond = conditionals[ic]
-        h = h .+ rearrange(cond_emb(cond), (:dim, :batch) --> (:dim, 1, :batch))
+        cond, cond_mask = conditionals[ic], conditional_mask[:, :, ic]
+        h = h .+ rearrange(cond_emb(cond), (:dim, :batch) --> (:dim, 1, :batch)) .*
+                 rearrange(cond_mask, (:seq_len, :batch) --> (1, :seq_len, :batch))
     end
     rope = model.rope[position(caches) .+ (1:size(tokens, 1))]
     for (layer, cache) in zip(model.layers, caches)
@@ -99,11 +109,10 @@ function generate(
 )
     n, b = size(initial_tokens, 1), size(initial_tokens, 2)
     tokens = reshape(initial_tokens, n, b)  # (seq_len, batch=1)
-    input_tokens = device(tokens)
     conditionals = device(conditionals)
-    n > 1 && model(tokens[1:n-1, :], conditionals; caches, mask=causal_mask, kws...)
+    n > 1 && model(device(tokens[1:n-1, :]), conditionals; caches, mask=causal_mask, kws...)
     for i in 1:max_new_tokens
-        logits = model(tokens[end:end, 1], conditionals; caches, kws...)
+        logits = model(device(tokens[end:end, 1]), conditionals; caches, kws...)
         tokens = [tokens; sampler(logits[:, end])]
         !isnothing(tokenizer_for_printing) && print(io, decode(tokenizer_for_printing, tokens[end:end] |> cpu, skip_special_tokens = false))
         sum(tokens[end:end]) == end_token && break
