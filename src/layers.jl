@@ -31,6 +31,32 @@ function (norm::RMSNorm)(x::AbstractArray{T}) where T
     return x .* (norm.weight ./ rms)
 end
 
+@concrete struct AdaLN
+    norm
+    scale
+    shift
+end
+
+Flux.@layer AdaLN
+
+function AdaLN(input_dim::Int, cond_dim::Int; norm_eps=1f-5)
+    norm = RMSNorm(input_dim, eps=norm_eps)
+    scale = Dense(cond_dim => input_dim, bias=false, init=Flux.zeros32)  # Zero init!
+    shift = Dense(cond_dim => input_dim, bias=false, init=Flux.zeros32)  # Zero init!
+    AdaLN(norm, scale, shift)
+end
+
+function (adaln::AdaLN)(x, cond)
+    normalized = adaln.norm(x)
+    scale_params = adaln.scale(cond)
+    shift_params = adaln.shift(cond)
+    if ndims(x) == 3
+        scale_params = reshape(scale_params, size(scale_params, 1), 1, size(scale_params, 2))
+        shift_params = reshape(shift_params, size(shift_params, 1), 1, size(shift_params, 2))
+    end
+    return (1f0 .+ scale_params) .* normalized .+ shift_params
+end
+
 
 @concrete struct RoPE
     cos
