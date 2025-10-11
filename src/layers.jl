@@ -195,6 +195,34 @@ function (block::TransformerBlock)(x; kws...)
     return out
 end
 
+@concrete struct AdaTransformerBlock
+    attention
+    feed_forward
+    attention_adaln
+    ffn_adaln
+end
+
+Flux.@layer AdaTransformerBlock
+
+function AdaTransformerBlock(
+    in_dim::Int, n_heads::Int, n_kv_heads::Int=n_heads, ff_hidden_dim::Int=4*in_dim;
+    norm_eps=1f-5, head_dim=in_dim ÷ n_heads, kws...
+)
+    AdaTransformerBlock(
+        Attention(in_dim, n_heads, n_kv_heads; head_dim, kws...),
+        FeedForward(in_dim, ff_hidden_dim),
+        AdaLN(in_dim, in_dim; norm_eps=norm_eps),
+        AdaLN(in_dim, in_dim; norm_eps=norm_eps)
+    )
+end
+
+function (block::AdaTransformerBlock)(x, cond; kws...)
+    # cond is (dim, batch)
+    h = x + block.attention(block.attention_adaln(x, cond); kws...)
+    out = h + block.feed_forward(block.ffn_adaln(h, cond))
+    return out
+end
+
 @concrete struct Transformer
     embeddings
     layers

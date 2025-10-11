@@ -15,12 +15,17 @@ const causal_mask = Val(:causal_mask)
 include("conditional.jl")
 export ConditionalTransformer
 
+incldue("adalm_model.jl")
+export AdaConditionalTransformer
+
 include("layers.jl")
 export FeedForward
 export RMSNorm
 export RoPE
 export Attention
+export AdaLN
 export TransformerBlock
+export AdaTransformerBlock
 export Transformer
 export unrope
 export rerope_cache!
