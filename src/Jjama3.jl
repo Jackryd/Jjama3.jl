@@ -15,7 +15,7 @@ const causal_mask = Val(:causal_mask)
 include("conditional.jl")
 export ConditionalTransformer
 
-include("adalm_model.jl")
+include("adaln_model.jl")
 export AdaConditionalTransformer
 
 include("layers.jl")

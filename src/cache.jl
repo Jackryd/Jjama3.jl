@@ -120,11 +120,11 @@ function position!(cache::KVCacheStack, new_pos::Int)
     return new_pos
 end
 
-function kv_cache(model::Union{Transformer, ConditionalTransformer}, args...; kws...)
+function kv_cache(model::Union{Transformer, ConditionalTransformer, AdaConditionalTransformer}, args...; kws...)
     return KVCacheStack(tuple((kv_cache(layer.attention, args...; kws...) for layer in model.layers)...))
 end
 
-no_kv_cache(model::Union{Transformer, ConditionalTransformer}) = KVCacheStack(tuple((no_kv_cache(layer.attention) for layer in model.layers)...))
+no_kv_cache(model::Union{Transformer, ConditionalTransformer, AdaConditionalTransformer}) = KVCacheStack(tuple((no_kv_cache(layer.attention) for layer in model.layers)...))
 
 function unrope!(caches::KVCacheStack, rope::RoPE)
     for cache in caches
