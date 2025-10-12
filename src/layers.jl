@@ -46,7 +46,7 @@ function AdaLN(input_dim::Int, cond_dim::Int; norm_eps=1f-5)
     AdaLN(norm, scale, shift)
 end
 
-function (adaln::AdaLN)(x, cond)
+function (adaln::AdaLN)(x, cond, pos_mask=nothing)
     normalized = adaln.norm(x)
     scale_params = adaln.scale(cond)
     shift_params = adaln.shift(cond)
@@ -54,7 +54,9 @@ function (adaln::AdaLN)(x, cond)
         scale_params = reshape(scale_params, size(scale_params, 1), 1, size(scale_params, 2))
         shift_params = reshape(shift_params, size(shift_params, 1), 1, size(shift_params, 2))
     end
-    return (1f0 .+ scale_params) .* normalized .+ shift_params
+    conditioned = (1f0 .+ scale_params) .* normalized .+ shift_params
+    isnothing(pos_mask) && return conditioned
+    return normalized .* (1f0 .- pos_mask) .+ conditioned .* pos_mask
 end
 
 
@@ -216,10 +218,9 @@ function AdaTransformerBlock(
     )
 end
 
-function (block::AdaTransformerBlock)(x, cond; kws...)
-    # cond is (dim, batch)
-    h = x + block.attention(block.attention_adaln(x, cond); kws...)
-    out = h + block.feed_forward(block.ffn_adaln(h, cond))
+function (block::AdaTransformerBlock)(x, cond, pos_mask=nothing; kws...)
+    h = x + block.attention(block.attention_adaln(x, cond, pos_mask); kws...)
+    out = h + block.feed_forward(block.ffn_adaln(h, cond, pos_mask))
     return out
 end
 
