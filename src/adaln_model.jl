@@ -1,5 +1,12 @@
 
 # === AdaConditionalTransformer ===
+function default_pos_mask(tokens::AbstractArray{<:Integer}; start_token_id::Integer)
+    is_start = tokens .== start_token_id
+    cumsum_start = cumsum(is_start, dims=1)
+    m = Float32.(cumsum_start .> 0)
+    return reshape(m, 1, size(tokens, 1), size(tokens, 2))
+end
+
 @concrete struct AdaConditionalTransformer
     tok_embeddings
     cond_embeddings
@@ -27,72 +34,92 @@ function AdaConditionalTransformer(cond_embeddings::Tuple,
     AdaConditionalTransformer(tok_embeddings, cond_embeddings, layers, norm, output, rope)
 end
 
-function (model::AdaConditionalTransformer)(tokens::AbstractArray{Int}, conditionals::Tuple; 
-                                            conditional_list = 1:length(conditionals), 
-                                            conditional_mask_gen = default_conditional_mask, 
-                                            caches = no_kv_cache(model), kws...)
-    h = model.tok_embeddings(tokens) # (dim, seq_len, batch)
-    
-    # Sum all conditioning embeddings into one global cond vector
+function (model::AdaConditionalTransformer)(
+    tokens::AbstractArray{Int},
+    conditionals::Tuple;
+    conditional_list = 1:length(conditionals),
+    conditional_mask_gen = default_conditional_mask,  # currently unused for Ada
+    caches = no_kv_cache(model),
+    pos_mask = nothing,
+    start_token_id = 2,  # assumes '>' is token 2 in your vocab "<>"
+    kws...
+)
+    # Token embeddings: (dim, seq_len, batch)
+    h = model.tok_embeddings(tokens)
+
+    # Sum all conditioning embeddings into a single (dim, batch) vector
     cond = model.cond_embeddings[first(conditional_list)](conditionals[first(conditional_list)])
-    for (ic, c) in enumerate(conditional_list)
+    for (ic, idx) in enumerate(conditional_list)
         ic == 1 && continue
-        cond = cond .+ model.cond_embeddings[c](conditionals[ic])
+        cond .+= model.cond_embeddings[idx](conditionals[ic])
     end
-    # cond is now (dim, batch)
-    
+
+    # Position-dependent conditioning mask:
+    # if caller didn't provide one, derive it from the tokens (train-time behaviour)
+    if isnothing(pos_mask)
+        pos_mask = default_pos_mask(tokens; start_token_id=start_token_id)
+    end
+
+    # RoPE slice based on current cache position
     rope = model.rope[position(caches) .+ (1:size(tokens, 1))]
+
+    # Pass cond + pos_mask into each AdaTransformerBlock
     for (layer, cache) in zip(model.layers, caches)
-        h = layer(h, cond; rope, cache, kws...)  # Pass cond to block!
+        h = layer(h, cond, pos_mask; rope, cache, kws...)
     end
+
     h = model.norm(h)
     output = model.output(h)
     return output
 end
 
+
 forward_loss(model::AdaConditionalTransformer, inputs::AbstractArray, conditionals, targets::AbstractArray; loss_mask = nothing, kws...) = 
     loss(model(inputs, conditionals; kws...), targets, loss_mask = loss_mask)
 
 function generate(
-    model::AdaConditionalTransformer, 
-    initial_tokens::AbstractArray{<:Integer},
+    model::AdaConditionalTransformer,
+    initial_tokens::AbstractArray{<:Integer},  # (seq_len, batch)
     conditionals;
-    io=stdout,
-    max_new_tokens=100,
-    sampler::Function=argmax_sampler,
+    io = stdout,
+    max_new_tokens = 100,
+    sampler::Function = argmax_sampler,
     tokenizer_for_printing = nothing,
     end_token = 128010,
-    caches=kv_cache(model, 1024, 1),
-    device=identity,
+    caches = kv_cache(model, 1024, 1),
+    device = identity,
+    start_token_id = 2,  # '>' token
     kws...
 )
     n, b = size(initial_tokens, 1), size(initial_tokens, 2)
+    @assert b == 1 "generate currently assumes batch size 1"
     tokens = reshape(initial_tokens, n, b)
     conditionals = device(conditionals)
-    
-    # Process initial tokens if n > 1
+
+    # 1) Prefill with the whole prefix (if any)
     if n > 1
-        # Create pos_mask for initial sequence
-        start_tok_id = 2  # Assuming '>' is token 2 from your AAs alphabet
-        start_pos = findfirst(==(start_tok_id), initial_tokens)
-        
-        # 0 before '>', 1 at and after '>'
-        pos_mask = Float32.(reshape(1:n-1, 1, n-1, 1) .>= (start_pos === nothing ? n+1 : start_pos))
-        pos_mask = device(pos_mask)
-        
-        model(device(tokens[1:n-1, :]), conditionals; caches, mask=causal_mask, pos_mask, kws...)
+        # Auto pos_mask from tokens; this matches training behaviour
+        model(device(tokens[1:n-1, :]), conditionals;
+              caches, mask=causal_mask, start_token_id=start_token_id, kws...)
     end
-    
-    # Generate new tokens - all get full conditioning (pos_mask=1)
+
+    # 2) Generate new tokens, forcing full conditioning (pos_mask = 1)
     pos_mask_single = device(ones(Float32, 1, 1, 1))
-    
+
     for i in 1:max_new_tokens
-        logits = model(device(reshape(tokens[end, :], 1, b)), conditionals; caches, pos_mask=pos_mask_single, kws...)
+        last_tok = device(reshape(tokens[end, :], 1, b))
+        logits = model(last_tok, conditionals;
+                       caches, pos_mask = pos_mask_single,  # after '>', always conditioned
+                       mask = causal_mask, start_token_id = start_token_id, kws...)
+
         new_token = sampler(logits[:, end])
         tokens = vcat(tokens, reshape([new_token], 1, b))
-        !isnothing(tokenizer_for_printing) && print(io, decode(tokenizer_for_printing, [new_token] |> cpu, skip_special_tokens = false))
+
+        if !isnothing(tokenizer_for_printing)
+            print(io, decode(tokenizer_for_printing, [new_token] |> cpu, skip_special_tokens = false))
+        end
         new_token == end_token && break
     end
-    
+
     return tokens
 end

@@ -69,11 +69,12 @@ function rerope!(cache::KVCache, rope::RoPE)
 end
 
 function Base.append!(cache1::KVCache, cache2::KVCache)
-    position(cache1) + position(cache2) > length(cache1) && throw(DimensionMismatch("appending cache2 to cache1 would exceed the sequence length of cache1"))
-    cs = current_sequence(cache1)
+    position(cache1) + position(cache2) > length(cache1) &&
+        throw(DimensionMismatch("appending cache2 to cache1 would exceed the sequence length of cache1"))
+    cs = current_sequence(cache2)
     cache1.k[:, position(cache1) .+ axes(cs.k, 2), :, :] .= cs.k
     cache1.v[:, position(cache1) .+ axes(cs.v, 2), :, :] .= cs.v
-    position!(cache1, position(cache1) + size(cache2.k, 2))
+    position!(cache1, position(cache1) + size(cs.k, 2))
     return cache1
 end
 
