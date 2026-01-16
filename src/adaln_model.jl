@@ -53,48 +53,45 @@ function AdaConditionalTransformer(
     AdaConditionalTransformer(tok_embeddings, cond_embeddings, layers, norm, output, rope)
 end
 
-# --- cache helpers (same pattern as ConditionalTransformer) ---
-
-function no_kv_cache(model::AdaConditionalTransformer)
-    return Tuple(no_kv_cache(layer.attention) for layer in model.layers)
-end
-
-function kv_cache(model::AdaConditionalTransformer, seq_length::Int, batch_size::Int = 1)
-    return Tuple(kv_cache(layer.attention, seq_length, batch_size) for layer in model.layers)
-end
-
 # --- forward pass ---
 
 function (model::AdaConditionalTransformer)(
-    tokens::AbstractArray{Int},
+    tokens::AbstractArray{<:Integer},
     conditionals::Tuple;
     conditional_list     = 1:length(conditionals),
-    conditional_mask_gen = default_conditional_mask,  # currently unused for Ada
+    conditional_mask_gen = default_conditional_mask,  # kept for API symmetry, unused here
     caches               = no_kv_cache(model),
     pos_mask             = nothing,
-    start_token_id       = 2,                         # assumes '>' is token 2 in "<>"
+    start_token_id       = 2,  # assumes '>' is token 2 in "<>ACDE..."
     kws...
 )
-    # embeddings: (dim, seq, batch)
+    # Token embeddings: (dim, seq, batch)
     h = model.tok_embeddings(tokens)
 
-    # Sum all conditioning embeddings into a single (dim, batch) vector
-    first_idx = first(conditional_list)
-    cond = model.cond_embeddings[first_idx](conditionals[first_idx])
-    for idx in Iterators.drop(conditional_list, 1)
-        cond .+= model.cond_embeddings[idx](conditionals[idx])
+    # --- Build a single conditioning vector cond :: (dim, batch) ---
+    # We mirror ConditionalTransformer’s use of `conditional_list`:
+    #   ic indexes into `conditionals`, c indexes into `cond_embeddings`.
+    cond = nothing
+    for (ic, c) in enumerate(conditional_list)
+        cond_emb = model.cond_embeddings[c]
+        cond_i   = cond_emb(conditionals[ic])  # (dim, batch)
+        cond = isnothing(cond) ? cond_i : (cond .+ cond_i)
     end
+    @assert !isnothing(cond) "AdaConditionalTransformer expects at least one conditional"
 
-    # If caller didn't give a pos_mask, derive from tokens ("after >" behaviour)
+    # --- Position mask: 1 only after first '>' in each sequence ---
     if pos_mask === nothing
         pos_mask = default_pos_mask(tokens; start_token_id = start_token_id)
+        # pos_mask :: (1, seq, batch) – broadcast inside the block
     end
 
-    # RoPE slice based on current cache position
+    # --- RoPE slice based on current cache position ---
     rope = model.rope[position(caches) .+ (1:size(tokens, 1))]
 
-    # Each AdaTransformerBlock takes (h, cond, pos_mask; rope, cache, kws...)
+    # --- Stack of AdaTransformerBlocks ---
     for (layer, cache) in zip(model.layers, caches)
+        # Each AdaTransformerBlock should have signature:
+        #   layer(h, cond, pos_mask; rope, cache, mask, sdpa, ...)
         h = layer(h, cond, pos_mask; rope, cache, kws...)
     end
 
@@ -122,46 +119,43 @@ function generate(
     model::AdaConditionalTransformer,
     initial_tokens::AbstractArray{<:Integer},  # (seq_len,) or (seq_len,1)
     conditionals;
-    io               = stdout,
-    max_new_tokens   = 100,
-    sampler::Function = argmax_sampler,
+    io                     = stdout,
+    max_new_tokens         = 100,
+    sampler::Function      = argmax_sampler,
     tokenizer_for_printing = nothing,
-    end_token        = 128010,
-    caches           = kv_cache(model, 1024, 1),
-    device           = identity,
-    start_token_id   = 2,   # '>' token
+    end_token              = 128010,
+    caches                 = kv_cache(model, 1024, 1),
+    device                 = identity,
+    start_token_id         = 2,
     kws...
 )
-    # Represent tokens as (seq_len, 1)
+    # Always treat as (seq, batch=1)
     tokens = reshape(initial_tokens, :, 1)
     conditionals = device(conditionals)
 
-    # ---- 1) Prefill with prefix (if any) ----
+    # ---- 1) Prefill with prefix (n > 1) ----
     n = size(tokens, 1)
     if n > 1
-        prefix = tokens[1:n-1, :]
-
-        pos_mask_prefix = default_pos_mask(prefix; start_token_id = start_token_id)
-        pos_mask_prefix = device(pos_mask_prefix)
+        prefix         = tokens[1:n-1, :]
+        pos_mask_pref  = default_pos_mask(prefix; start_token_id = start_token_id)
+        pos_mask_pref  = device(pos_mask_pref)
 
         model(
             device(prefix),
             conditionals;
             caches,
             mask     = causal_mask,
-            pos_mask = pos_mask_prefix,
+            pos_mask = pos_mask_pref,
             kws...
         )
     end
 
-    # ---- 2) Autoregressive generation ----
+    # ---- 2) Autoregressive sampling ----
     for step in 1:max_new_tokens
-        # Recompute "after >" mask on the fly for the whole sequence,
-        # then take the last position only
         full_mask     = default_pos_mask(tokens; start_token_id = start_token_id)
         pos_mask_step = device(full_mask[:, end:end, :])  # (1,1,1)
+        last_tok      = device(tokens[end:end, :])        # (1,1)
 
-        last_tok = device(tokens[end:end, :])             # (1,1)
         logits = model(
             last_tok,
             conditionals;
@@ -172,13 +166,12 @@ function generate(
         )
 
         new_token = sampler(logits[:, end])
-        tokens = vcat(tokens, reshape([new_token], 1, 1))
+        tokens    = vcat(tokens, reshape([new_token], 1, 1))
 
         if !isnothing(tokenizer_for_printing)
             print(
                 io,
-                decode(tokenizer_for_printing, [new_token] |> cpu;
-                       skip_special_tokens = false),
+                decode(tokenizer_for_printing, [new_token] |> cpu; skip_special_tokens = false),
             )
         end
 
