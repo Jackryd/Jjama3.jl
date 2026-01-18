@@ -21,6 +21,7 @@ end
 @concrete struct AdaConditionalTransformer
     tok_embeddings
     cond_embeddings
+    cond_mlp
     layers
     norm
     output
@@ -36,6 +37,7 @@ function AdaConditionalTransformer(
     norm_eps = 1f-5,
     rope_settings = (theta = 500000f0, use_scaled = false, scale_factor = 8),
     head_dim = dim ÷ n_heads,
+    mixer_hidden = 2dim,
     kws...
 )
     tok_embeddings = Embedding(vocab_size => dim)
@@ -46,52 +48,57 @@ function AdaConditionalTransformer(
         for _ in 1:n_layers
     )
 
+    # Learned mixer: (3d -> hidden -> d)
+    cond_mlp = Chain(
+        Dense(length(cond_embeddings)*dim => mixer_hidden, leakyrelu),
+        Dense(mixer_hidden => dim),
+    )
+
     norm   = RMSNorm(dim, eps = norm_eps)
     output = Dense(dim => vocab_size, bias = false)
     rope   = RoPE(head_dim, max_seq_len * 2; rope_settings...)
 
-    AdaConditionalTransformer(tok_embeddings, cond_embeddings, layers, norm, output, rope)
+    AdaConditionalTransformer(tok_embeddings, cond_embeddings, cond_mlp, layers, norm, output, rope)
 end
-
-# --- forward pass ---
 
 function (model::AdaConditionalTransformer)(
     tokens::AbstractArray{<:Integer},
     conditionals::Tuple;
     conditional_list     = 1:length(conditionals),
-    conditional_mask_gen = default_conditional_mask,  # kept for API symmetry, unused here
     caches               = no_kv_cache(model),
     pos_mask             = nothing,
-    start_token_id       = 2,  # assumes '>' is token 2 in "<>ACDE..."
+    start_token_id       = nothing,
     kws...
 )
-    # Token embeddings: (dim, seq, batch)
-    h = model.tok_embeddings(tokens)
+    h = model.tok_embeddings(tokens) # (dim, seq, batch)
 
-    # --- Build a single conditioning vector cond :: (dim, batch) ---
-    # We mirror ConditionalTransformer’s use of `conditional_list`:
-    #   ic indexes into `conditionals`, c indexes into `cond_embeddings`.
-    cond = nothing
+    # Robust start token id (don’t assume "2")
+    if start_token_id === nothing
+        # Fallback to "2" (works for your "<>AC..." vocab)
+        start_token_id = 2
+    end
+
+    # ---- Build cond parts (dim, batch) for each conditional channel ----
+    cond_parts = ()
     for (ic, c) in enumerate(conditional_list)
         cond_emb = model.cond_embeddings[c]
-        cond_i   = cond_emb(conditionals[ic])  # (dim, batch)
-        cond = isnothing(cond) ? cond_i : (cond .+ cond_i)
+        cond_i   = cond_emb(conditionals[c])  # (dim, batch)
+        cond_parts = (cond_parts..., cond_i)
     end
-    @assert !isnothing(cond) "AdaConditionalTransformer expects at least one conditional"
+    @assert length(cond_parts) > 0
 
-    # --- Position mask: 1 only after first '>' in each sequence ---
+    # ---- concat + mix ----
+    cond_cat = vcat(cond_parts...)        # (len*dim, batch)
+    cond     = model.cond_mlp(cond_cat)   # (dim, batch)
+
+    # ---- Position mask: 1 after '>' ----
     if pos_mask === nothing
-        pos_mask = default_pos_mask(tokens; start_token_id = start_token_id)
-        # pos_mask :: (1, seq, batch) – broadcast inside the block
+        pos_mask = default_pos_mask(tokens; start_token_id = start_token_id) # (1, seq, batch)
     end
 
-    # --- RoPE slice based on current cache position ---
     rope = model.rope[position(caches) .+ (1:size(tokens, 1))]
 
-    # --- Stack of AdaTransformerBlocks ---
     for (layer, cache) in zip(model.layers, caches)
-        # Each AdaTransformerBlock should have signature:
-        #   layer(h, cond, pos_mask; rope, cache, mask, sdpa, ...)
         h = layer(h, cond, pos_mask; rope, cache, kws...)
     end
 
