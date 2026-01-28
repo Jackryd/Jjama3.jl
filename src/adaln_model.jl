@@ -142,60 +142,93 @@ end
 #   Prefill WITH causal mask
 #   Decode WITHOUT causal mask
 # ------------------------------------------------------------
+function _build_pos_mask(tokens::AbstractArray{<:Integer}, conditional_list;
+                         conditional_mask_gen=nothing, start_token_id::Int=2)
+    if conditional_mask_gen === nothing
+        return default_pos_mask(tokens; start_token_id=start_token_id)  # (1,seq,batch)
+    else
+        cm = ChainRulesCore.ignore_derivatives() do
+            conditional_mask_gen(tokens, conditional_list)               # (seq,batch,ncond)
+        end
+        return conditional_mask_to_pos_mask(cm)                          # (1,seq,batch)
+    end
+end
+
 function generate(
     model::AdaConditionalTransformer,
     initial_tokens::AbstractArray{<:Integer},
     conditionals;
-    io = stdout,
-    max_new_tokens = 100,
-    sampler::Function = argmax_sampler,
-    tokenizer_for_printing = nothing,
-    end_token = 128010,
-    caches = kv_cache(model, 1024, 1),
-    device = identity,
-    conditional_mask_gen = nothing,   # pass ConditionalMask(1) here
+    io=stdout,
+    max_new_tokens=100,
+    sampler::Function=argmax_sampler,
+    tokenizer_for_printing=nothing,
+    end_token=128010,
+    caches=kv_cache(model, 1024, 1),
+    device=identity,
+    conditional_mask_gen=nothing,
+    start_token_id::Int=2,
+    conditional_list=nothing,
     kws...
 )
     # Make (seq, batch)
-    if ndims(initial_tokens) == 1
-        tokens = reshape(initial_tokens, :, 1)
-    else
-        n, b = size(initial_tokens, 1), size(initial_tokens, 2)
-        tokens = reshape(initial_tokens, n, b)
-    end
+    tokens = ndims(initial_tokens) == 1 ? reshape(initial_tokens, :, 1) :
+             reshape(initial_tokens, size(initial_tokens,1), size(initial_tokens,2))
 
     n, b = size(tokens, 1), size(tokens, 2)
-    conditionals = device(conditionals)
+    conditionals_dev = device(conditionals)
 
-    # Prefill (WITH causal mask)
-    n > 1 && model(
-        device(tokens[1:n-1, :]),
-        conditionals;
-        caches,
-        mask = causal_mask,
-        conditional_mask_gen = conditional_mask_gen,
-        kws...
-    )
+    # decide which cond channels we’re using (match ConditionalTransformer semantics)
+    conditional_list === nothing && (conditional_list = 1:length(conditionals))
 
-    # Decode (NO causal mask)
+    # ---- Prefill (WITH causal mask) ----
+    if n > 1
+        pref_tokens = tokens[1:n-1, :]
+        pref_pm = _build_pos_mask(pref_tokens, conditional_list;
+                                  conditional_mask_gen=conditional_mask_gen,
+                                  start_token_id=start_token_id)
+        model(
+            device(pref_tokens),
+            conditionals_dev;
+            caches,
+            mask=causal_mask,
+            pos_mask=device(pref_pm),
+            conditional_list=conditional_list,
+            kws...
+        )
+    end
+
+    # ---- Decode (NO causal mask) ----
     for i in 1:max_new_tokens
+        # IMPORTANT: build mask from FULL prefix, then take last position slice
+        pm_full = _build_pos_mask(tokens, conditional_list;
+                                  conditional_mask_gen=conditional_mask_gen,
+                                  start_token_id=start_token_id)
+        pm_step = device(pm_full[:, end:end, :])          # (1,1,batch)
+
         logits = model(
             device(tokens[end:end, :]),
-            conditionals;
+            conditionals_dev;
             caches,
-            conditional_mask_gen = conditional_mask_gen,
+            pos_mask=pm_step,
+            conditional_list=conditional_list,
             kws...
         )
 
         new_token = sampler(logits[:, end])
-        tokens = [tokens; new_token]
 
-        !isnothing(tokenizer_for_printing) && print(
-            io,
-            decode(tokenizer_for_printing, tokens[end:end] |> cpu; skip_special_tokens = false),
-        )
-
-        sum(tokens[end:end]) == end_token && break
+        if new_token isa Number
+            tokens = vcat(tokens, reshape([new_token], 1, 1))
+            if !isnothing(tokenizer_for_printing)
+                print(io, decode(tokenizer_for_printing, [new_token] |> cpu; skip_special_tokens=false))
+            end
+            new_token == end_token && break
+        else
+            tokens = vcat(tokens, reshape(new_token, 1, b))
+            if !isnothing(tokenizer_for_printing)
+                print(io, decode(tokenizer_for_printing, new_token |> cpu; skip_special_tokens=false))
+            end
+            (b == 1 && new_token[1] == end_token) && break
+        end
     end
 
     return tokens
