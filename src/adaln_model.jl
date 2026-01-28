@@ -1,14 +1,22 @@
-# === AdaConditionalTransformer utilities ===
+# ============================================================
+#  Simple AdaLN Conditional Transformer
+#    - No gates
+#    - No cond_mlp
+#    - Uses ConditionalMask-style conditional_mask_gen
+#    - Sampling: prefill WITH causal mask, decode WITHOUT
+# ============================================================
 
-"""
-    default_pos_mask(tokens; start_token_id)
+# Assumes these exist in Jjama3 scope:
+#   Attention, FeedForward, AdaLN, RMSNorm, RoPE
+#   causal_mask, loss, argmax_sampler, decode
+#   kv_cache, no_kv_cache, position (from cache.jl)
+#
+# And your additive model provides ConditionalMask(1) which matches:
+#   conditional_mask_gen(tokens, conditional_list) -> (seq, batch, ncond)
 
-Return a mask of shape (1, seq_len, batch) that is 0 before the first
-occurrence of `start_token_id` (usually '>') and 1 from that position onwards.
-
-This is exactly the "only condition after `>`" behaviour we want for both
-training and generation.
-"""
+# ------------------------------------------------------------
+# default_pos_mask: fallback if no ConditionalMask is provided
+# ------------------------------------------------------------
 function default_pos_mask(tokens::AbstractArray{<:Integer}; start_token_id::Integer)
     is_start      = tokens .== start_token_id              # (seq, batch)
     cumsum_start  = cumsum(is_start, dims = 1)             # (seq, batch)
@@ -16,12 +24,59 @@ function default_pos_mask(tokens::AbstractArray{<:Integer}; start_token_id::Inte
     return reshape(m, 1, size(tokens, 1), size(tokens, 2)) # (1, seq, batch)
 end
 
-# === AdaConditionalTransformer ===
+# --- helper: (seq,batch,ncond) -> (1,seq,batch) ---
+conditional_mask_to_pos_mask(cm) = begin
+    pm = maximum(cm; dims = 3)                       # (seq, batch, 1)
+    pm = dropdims(pm; dims = 3)                      # (seq, batch)
+    reshape(Float32.(pm), 1, size(pm,1), size(pm,2)) # (1, seq, batch)
+end
 
+
+# ------------------------------------------------------------
+# AdaTransformerBlock: AdaLN + Attention/FFN, no gates
+# ------------------------------------------------------------
+@concrete struct AdaTransformerBlock
+    attention
+    feed_forward
+    attention_adaln
+    ffn_adaln
+end
+
+Flux.@layer AdaTransformerBlock
+
+function AdaTransformerBlock(
+    in_dim::Int, n_heads::Int, n_kv_heads::Int = n_heads, ff_hidden_dim::Int = 4 * in_dim;
+    norm_eps = 1f-5, head_dim = in_dim ÷ n_heads, kws...
+)
+    AdaTransformerBlock(
+        Attention(in_dim, n_heads, n_kv_heads; head_dim, kws...),
+        FeedForward(in_dim, ff_hidden_dim),
+        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
+        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
+    )
+end
+
+function (block::AdaTransformerBlock)(x, cond, pos_mask = nothing; kws...)
+    # Attention
+    x_mod = block.attention_adaln(x, cond, pos_mask)
+    h     = x .+ block.attention(x_mod; kws...)
+
+    # FFN
+    h_mod = block.ffn_adaln(h, cond, pos_mask)
+    out   = h .+ block.feed_forward(h_mod)
+
+    return out
+end
+
+
+# ------------------------------------------------------------
+# AdaConditionalTransformer
+#   - sums conditional embeddings (no MLP)
+#   - injects via AdaLN with pos_mask
+# ------------------------------------------------------------
 @concrete struct AdaConditionalTransformer
     tok_embeddings
     cond_embeddings
-    cond_mlp
     layers
     norm
     output
@@ -37,63 +92,60 @@ function AdaConditionalTransformer(
     norm_eps = 1f-5,
     rope_settings = (theta = 500000f0, use_scaled = false, scale_factor = 8),
     head_dim = dim ÷ n_heads,
-    mixer_hidden = 2dim,
     kws...
 )
     tok_embeddings = Embedding(vocab_size => dim)
 
     layers = Tuple(
         AdaTransformerBlock(dim, n_heads, n_kv_heads, ff_hidden_dim;
-                            norm_eps, head_dim, kws...)
+                              norm_eps = norm_eps, head_dim = head_dim, kws...)
         for _ in 1:n_layers
-    )
-
-    # Learned mixer: (3d -> hidden -> d)
-    cond_mlp = Chain(
-        Dense(length(cond_embeddings)*dim => mixer_hidden, leakyrelu),
-        Dense(mixer_hidden => dim),
     )
 
     norm   = RMSNorm(dim, eps = norm_eps)
     output = Dense(dim => vocab_size, bias = false)
     rope   = RoPE(head_dim, max_seq_len * 2; rope_settings...)
 
-    AdaConditionalTransformer(tok_embeddings, cond_embeddings, cond_mlp, layers, norm, output, rope)
+    AdaConditionalTransformer(tok_embeddings, cond_embeddings, layers, norm, output, rope)
 end
 
+
+# ------------------------------------------------------------
+# Forward
+#   - conditional_list semantics match ConditionalTransformer:
+#       ic indexes into `conditionals`
+#       c  indexes into `cond_embeddings`
+# ------------------------------------------------------------
 function (model::AdaConditionalTransformer)(
     tokens::AbstractArray{<:Integer},
     conditionals::Tuple;
     conditional_list     = 1:length(conditionals),
+    conditional_mask_gen = nothing,             # pass ConditionalMask(1) here
     caches               = no_kv_cache(model),
     pos_mask             = nothing,
-    start_token_id       = nothing,
+    start_token_id       = 2,                   # assumes '>' is token 2 in "<>ACDE..."
     kws...
 )
-    h = model.tok_embeddings(tokens) # (dim, seq, batch)
+    h = model.tok_embeddings(tokens)  # (dim, seq, batch)
 
-    # Robust start token id (don’t assume "2")
-    if start_token_id === nothing
-        # Fallback to "2" (works for your "<>AC..." vocab)
-        start_token_id = 2
-    end
-
-    # ---- Build cond parts (dim, batch) for each conditional channel ----
-    cond_parts = ()
+    # ---- Sum conditioning channels (NO MLP) ----
+    cond = nothing
     for (ic, c) in enumerate(conditional_list)
-        cond_emb = model.cond_embeddings[c]
-        cond_i   = cond_emb(conditionals[c])  # (dim, batch)
-        cond_parts = (cond_parts..., cond_i)
+        cond_i = model.cond_embeddings[c](conditionals[ic])  # (dim, batch)
+        cond = (cond === nothing) ? cond_i : (cond .+ cond_i)
     end
-    @assert length(cond_parts) > 0
+    @assert cond !== nothing "AdaConditionalTransformer expects at least one conditional"
 
-    # ---- concat + mix ----
-    cond_cat = vcat(cond_parts...)        # (len*dim, batch)
-    cond     = model.cond_mlp(cond_cat)   # (dim, batch)
-
-    # ---- Position mask: 1 after '>' ----
+    # ---- Build pos_mask from ConditionalMask if given ----
     if pos_mask === nothing
-        pos_mask = default_pos_mask(tokens; start_token_id = start_token_id) # (1, seq, batch)
+        if conditional_mask_gen === nothing
+            pos_mask = default_pos_mask(tokens; start_token_id = start_token_id)   # (1, seq, batch)
+        else
+            cm = Flux.ChainRulesCore.ignore_derivatives() do
+                conditional_mask_gen(tokens, conditional_list)  # (seq, batch, ncond)
+            end
+            pos_mask = conditional_mask_to_pos_mask(cm)         # (1, seq, batch)
+        end
     end
 
     rope = model.rope[position(caches) .+ (1:size(tokens, 1))]
@@ -106,8 +158,10 @@ function (model::AdaConditionalTransformer)(
     return model.output(h)
 end
 
-# --- loss wrapper (Flux-style) ---
 
+# ------------------------------------------------------------
+# Loss wrapper (same style as Jjama3.forward_loss)
+# ------------------------------------------------------------
 function forward_loss(
     model::AdaConditionalTransformer,
     inputs::AbstractArray,
@@ -120,69 +174,66 @@ function forward_loss(
     return loss(logits, targets, loss_mask = loss_mask)
 end
 
-# --- autoregressive generation ---
 
+# ------------------------------------------------------------
+# Sampling (identical style to ConditionalTransformer)
+#   Prefill WITH causal mask
+#   Decode WITHOUT causal mask
+# ------------------------------------------------------------
 function generate(
     model::AdaConditionalTransformer,
-    initial_tokens::AbstractArray{<:Integer},  # (seq_len,) or (seq_len,1)
+    initial_tokens::AbstractArray{<:Integer},
     conditionals;
-    io                     = stdout,
-    max_new_tokens         = 100,
-    sampler::Function      = argmax_sampler,
+    io = stdout,
+    max_new_tokens = 100,
+    sampler::Function = argmax_sampler,
     tokenizer_for_printing = nothing,
-    end_token              = 128010,
-    caches                 = kv_cache(model, 1024, 1),
-    device                 = identity,
-    start_token_id         = 2,
+    end_token = 128010,
+    caches = kv_cache(model, 1024, 1),
+    device = identity,
+    conditional_mask_gen = nothing,   # pass ConditionalMask(1) here
     kws...
 )
-    # Always treat as (seq, batch=1)
-    tokens = reshape(initial_tokens, :, 1)
-    conditionals = device(conditionals)
-
-    # ---- 1) Prefill with prefix (n > 1) ----
-    n = size(tokens, 1)
-    if n > 1
-        prefix         = tokens[1:n-1, :]
-        pos_mask_pref  = default_pos_mask(prefix; start_token_id = start_token_id)
-        pos_mask_pref  = device(pos_mask_pref)
-
-        model(
-            device(prefix),
-            conditionals;
-            caches,
-            mask     = causal_mask,
-            pos_mask = pos_mask_pref,
-            kws...
-        )
+    # Make (seq, batch)
+    if ndims(initial_tokens) == 1
+        tokens = reshape(initial_tokens, :, 1)
+    else
+        n, b = size(initial_tokens, 1), size(initial_tokens, 2)
+        tokens = reshape(initial_tokens, n, b)
     end
 
-    # ---- 2) Autoregressive sampling ----
-    for step in 1:max_new_tokens
-        full_mask     = default_pos_mask(tokens; start_token_id = start_token_id)
-        pos_mask_step = device(full_mask[:, end:end, :])  # (1,1,1)
-        last_tok      = device(tokens[end:end, :])        # (1,1)
+    n, b = size(tokens, 1), size(tokens, 2)
+    conditionals = device(conditionals)
 
+    # Prefill (WITH causal mask)
+    n > 1 && model(
+        device(tokens[1:n-1, :]),
+        conditionals;
+        caches,
+        mask = causal_mask,
+        conditional_mask_gen = conditional_mask_gen,
+        kws...
+    )
+
+    # Decode (NO causal mask)
+    for i in 1:max_new_tokens
         logits = model(
-            last_tok,
+            device(tokens[end:end, :]),
             conditionals;
             caches,
-            mask     = causal_mask,
-            pos_mask = pos_mask_step,
+            conditional_mask_gen = conditional_mask_gen,
             kws...
         )
 
         new_token = sampler(logits[:, end])
-        tokens    = vcat(tokens, reshape([new_token], 1, 1))
+        tokens = [tokens; new_token]
 
-        if !isnothing(tokenizer_for_printing)
-            print(
-                io,
-                decode(tokenizer_for_printing, [new_token] |> cpu; skip_special_tokens = false),
-            )
-        end
+        !isnothing(tokenizer_for_printing) && print(
+            io,
+            decode(tokenizer_for_printing, tokens[end:end] |> cpu; skip_special_tokens = false),
+        )
 
-        new_token == end_token && break
+        sum(tokens[end:end]) == end_token && break
     end
 
     return tokens
