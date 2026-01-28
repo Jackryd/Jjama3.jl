@@ -31,44 +31,6 @@ conditional_mask_to_pos_mask(cm) = begin
     reshape(Float32.(pm), 1, size(pm,1), size(pm,2)) # (1, seq, batch)
 end
 
-
-# ------------------------------------------------------------
-# AdaTransformerBlock: AdaLN + Attention/FFN, no gates
-# ------------------------------------------------------------
-@concrete struct AdaTransformerBlock
-    attention
-    feed_forward
-    attention_adaln
-    ffn_adaln
-end
-
-Flux.@layer AdaTransformerBlock
-
-function AdaTransformerBlock(
-    in_dim::Int, n_heads::Int, n_kv_heads::Int = n_heads, ff_hidden_dim::Int = 4 * in_dim;
-    norm_eps = 1f-5, head_dim = in_dim ÷ n_heads, kws...
-)
-    AdaTransformerBlock(
-        Attention(in_dim, n_heads, n_kv_heads; head_dim, kws...),
-        FeedForward(in_dim, ff_hidden_dim),
-        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
-        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
-    )
-end
-
-function (block::AdaTransformerBlock)(x, cond, pos_mask = nothing; kws...)
-    # Attention
-    x_mod = block.attention_adaln(x, cond, pos_mask)
-    h     = x .+ block.attention(x_mod; kws...)
-
-    # FFN
-    h_mod = block.ffn_adaln(h, cond, pos_mask)
-    out   = h .+ block.feed_forward(h_mod)
-
-    return out
-end
-
-
 # ------------------------------------------------------------
 # AdaConditionalTransformer
 #   - sums conditional embeddings (no MLP)

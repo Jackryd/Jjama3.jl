@@ -197,67 +197,39 @@ function (block::TransformerBlock)(x; kws...)
     return out
 end
 
+# ------------------------------------------------------------
+# AdaTransformerBlock: AdaLN + Attention/FFN, no gates
+# ------------------------------------------------------------
 @concrete struct AdaTransformerBlock
     attention
     feed_forward
     attention_adaln
     ffn_adaln
-    gate_attn
-    gate_ffn
 end
 
 Flux.@layer AdaTransformerBlock
 
 function AdaTransformerBlock(
-    in_dim::Int, n_heads::Int, n_kv_heads::Int=n_heads, ff_hidden_dim::Int=4*in_dim;
-    norm_eps=1f-5, head_dim=in_dim ÷ n_heads, kws...
+    in_dim::Int, n_heads::Int, n_kv_heads::Int = n_heads, ff_hidden_dim::Int = 4 * in_dim;
+    norm_eps = 1f-5, head_dim = in_dim ÷ n_heads, kws...
 )
     AdaTransformerBlock(
         Attention(in_dim, n_heads, n_kv_heads; head_dim, kws...),
         FeedForward(in_dim, ff_hidden_dim),
-
-        # AdaLN-Zero (scale/shift zero-init inside AdaLN)
-        AdaLN(in_dim, in_dim; norm_eps=norm_eps),
-        AdaLN(in_dim, in_dim; norm_eps=norm_eps),
-
-        # DiT-style residual gates (ZERO init)
-        Dense(in_dim => in_dim; bias=true, init=Flux.zeros32),
-        Dense(in_dim => in_dim; bias=true, init=Flux.zeros32),
+        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
+        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
     )
 end
 
-function (block::AdaTransformerBlock)(x, cond, pos_mask=nothing; kws...)
-    # ---- Attention ----
+function (block::AdaTransformerBlock)(x, cond, pos_mask = nothing; kws...)
+    # Attention
     x_mod = block.attention_adaln(x, cond, pos_mask)
-    attn  = block.attention(x_mod; kws...)  # (dim, seq, batch)
+    h     = x .+ block.attention(x_mod; kws...)
 
-    gateA = block.gate_attn(cond)                               # (dim, batch)
-    gateA = reshape(gateA, size(gateA,1), 1, size(gateA,2))     # (dim, 1, batch)
-
-    # Prefix: scale = 1
-    # Suffix: scale = 1 + gateA
-    if isnothing(pos_mask)
-        scaleA = 1f0 .+ gateA                                  # (dim, 1, batch) broadcasts over seq
-    else
-        scaleA = 1f0 .+ gateA .* pos_mask                       # (dim, seq, batch)
-    end
-
-    h = x .+ scaleA .* attn
-
-    # ---- FFN ----
+    # FFN
     h_mod = block.ffn_adaln(h, cond, pos_mask)
-    ff    = block.feed_forward(h_mod)                           # (dim, seq, batch)
+    out   = h .+ block.feed_forward(h_mod)
 
-    gateF = block.gate_ffn(cond)                                # (dim, batch)
-    gateF = reshape(gateF, size(gateF,1), 1, size(gateF,2))     # (dim, 1, batch)
-
-    if isnothing(pos_mask)
-        scaleF = 1f0 .+ gateF
-    else
-        scaleF = 1f0 .+ gateF .* pos_mask
-    end
-
-    out = h .+ scaleF .* ff
     return out
 end
 
