@@ -221,15 +221,15 @@ function AdaTransformerBlock(
     )
 end
 
-function (block::AdaTransformerBlock)(x, cond, pos_mask = nothing; kws...)
-    # Attention
+function (block::AdaTransformerBlock)(
+    x, cond, pos_mask=nothing;
+    rope=identity, cache=no_cache, sdpa=sdpa, mask=false
+)
     x_mod = block.attention_adaln(x, cond, pos_mask)
-    h     = x .+ block.attention(x_mod; kws...)
+    h     = x .+ block.attention(x_mod; rope, cache, sdpa, mask)
 
-    # FFN
     h_mod = block.ffn_adaln(h, cond, pos_mask)
     out   = h .+ block.feed_forward(h_mod)
-
     return out
 end
 
