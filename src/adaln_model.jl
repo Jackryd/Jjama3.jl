@@ -1,10 +1,4 @@
 
-function default_conditional_mask(tokens, conditional_list)
-    mask = similar(tokens, size(tokens, 1), size(tokens, 2), length(conditional_list))
-    mask .= 1
-    return mask
-end
-
 # ------------------------------------------------------------
 # AdaConditionalTransformer
 #   - sums conditional embeddings (no MLP)
