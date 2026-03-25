@@ -35,28 +35,64 @@ end
     norm
     scale
     shift
+    gate
 end
 
 Flux.@layer AdaLN
 
-function AdaLN(input_dim::Int, cond_dim::Int; norm_eps=1f-5)
+function AdaLN(input_dim::Int, cond_dim::Int; norm_eps=1f-5, with_gate::Bool=false)
     norm = RMSNorm(input_dim, eps=norm_eps)
     scale = Dense(cond_dim => input_dim, bias=false, init=Flux.zeros32)  # Zero init!
     shift = Dense(cond_dim => input_dim, bias=false, init=Flux.zeros32)  # Zero init!
-    AdaLN(norm, scale, shift)
+    gate = with_gate ? Dense(cond_dim => input_dim, bias=false, init=Flux.zeros32) : nothing
+    AdaLN(norm, scale, shift, gate)
 end
 
 function (adaln::AdaLN)(x, cond, pos_mask=nothing)
     normalized = adaln.norm(x)
     scale_params = adaln.scale(cond)
     shift_params = adaln.shift(cond)
+
     if ndims(x) == 3
         scale_params = reshape(scale_params, size(scale_params, 1), 1, size(scale_params, 2))
         shift_params = reshape(shift_params, size(shift_params, 1), 1, size(shift_params, 2))
     end
+
     conditioned = (1f0 .+ scale_params) .* normalized .+ shift_params
-    isnothing(pos_mask) && return conditioned
-    return normalized .* (1f0 .- pos_mask) .+ conditioned .* pos_mask
+    conditioned = isnothing(pos_mask) ? conditioned : (normalized .* (1f0 .- pos_mask) .+ conditioned .* pos_mask)
+
+    if isnothing(adaln.gate)
+        return conditioned, one(eltype(normalized))
+    end
+
+    gate_params = adaln.gate(cond)
+    if ndims(x) == 3
+        gate_params = reshape(gate_params, size(gate_params, 1), 1, size(gate_params, 2))
+    end
+
+    gate = 1f0 .+ gate_params
+    if !isnothing(pos_mask)
+        gate = (1f0 .- pos_mask) .+ gate .* pos_mask
+    end
+
+    return conditioned, gate
+end
+
+# Backward-compatible loader: older checkpoints may not contain `gate`.
+function Flux.loadmodel!(adaln::AdaLN, state::NamedTuple)
+    Flux.loadmodel!(adaln.norm, state.norm)
+    Flux.loadmodel!(adaln.scale, state.scale)
+    Flux.loadmodel!(adaln.shift, state.shift)
+
+    if haskey(state, :gate)
+        if isnothing(adaln.gate)
+            isnothing(state.gate) || throw(ArgumentError("Checkpoint contains AdaLN gate weights but target model has with_gate=false"))
+        else
+            isnothing(state.gate) ? nothing : Flux.loadmodel!(adaln.gate, state.gate)
+        end
+    end
+
+    return adaln
 end
 
 
@@ -211,13 +247,13 @@ Flux.@layer AdaTransformerBlock
 
 function AdaTransformerBlock(
     in_dim::Int, n_heads::Int, n_kv_heads::Int = n_heads, ff_hidden_dim::Int = 4 * in_dim;
-    norm_eps = 1f-5, head_dim = in_dim ÷ n_heads, kws...
+    norm_eps = 1f-5, head_dim = in_dim ÷ n_heads, adaln_with_gates::Bool = false, kws...
 )
     AdaTransformerBlock(
         Attention(in_dim, n_heads, n_kv_heads; head_dim, kws...),
         FeedForward(in_dim, ff_hidden_dim),
-        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
-        AdaLN(in_dim, in_dim; norm_eps = norm_eps),
+        AdaLN(in_dim, in_dim; norm_eps = norm_eps, with_gate = adaln_with_gates),
+        AdaLN(in_dim, in_dim; norm_eps = norm_eps, with_gate = adaln_with_gates),
     )
 end
 
@@ -225,11 +261,11 @@ function (block::AdaTransformerBlock)(
     x, cond, pos_mask=nothing;
     rope=identity, cache=no_cache, sdpa=sdpa, mask=false
 )
-    x_mod = block.attention_adaln(x, cond, pos_mask)
-    h     = x .+ block.attention(x_mod; rope, cache, sdpa, mask)
+    x_mod, attn_gate = block.attention_adaln(x, cond, pos_mask)
+    h                = x .+ attn_gate .* block.attention(x_mod; rope, cache, sdpa, mask)
 
-    h_mod = block.ffn_adaln(h, cond, pos_mask)
-    out   = h .+ block.feed_forward(h_mod)
+    h_mod, ffn_gate  = block.ffn_adaln(h, cond, pos_mask)
+    out              = h .+ ffn_gate .* block.feed_forward(h_mod)
     return out
 end
 

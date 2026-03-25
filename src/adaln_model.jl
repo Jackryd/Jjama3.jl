@@ -81,9 +81,19 @@ function (model::AdaConditionalTransformer)(
     end
 
     rope = model.rope[position(caches) .+ (1:size(tokens, 1))]
+    checkpoint_layers = get(kws, :checkpoint_layers, false)
+    kw_nt = (; kws...)
+    layer_kws = Base.structdiff(kw_nt, (checkpoint_layers = checkpoint_layers,))
 
     for (layer, cache) in zip(model.layers, caches)
-        h = layer(h, cond, pos_mask; rope, cache, kws...)
+        if checkpoint_layers
+            h = Flux.Zygote.checkpointed(
+                (h_, c_, pm_) -> layer(h_, c_, pm_; rope=rope, cache=cache, layer_kws...),
+                h, cond, pos_mask,
+            )
+        else
+            h = layer(h, cond, pos_mask; rope, cache, layer_kws...)
+        end
     end
 
     h = model.norm(h)
