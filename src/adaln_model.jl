@@ -63,7 +63,8 @@ function (model::AdaConditionalTransformer)(
 
     # --- handle empty conditionals (eq-model in tree code) ---
     if isempty(conditional_list)
-        cond = similar(h, size(h,1), size(h,3)); cond .= 0
+        cond_dim = size(first(model.layers).attention_adaln.scale.weight, 2)
+        cond = similar(first(model.layers).attention_adaln.scale.weight, cond_dim, size(h,3)); cond .= 0
         pos_mask = similar(h, Float32, 1, size(h,2), size(h,3)); pos_mask .= 0
     else
         # --- same mask API as ConditionalTransformer ---
