@@ -29,9 +29,19 @@ function Base.show(io::IO, ::MIME"text/plain", cache::KVCache)
     print(io, "  batches: $(batch_size(cache))")
 end
 
+function _cache_storage(proj)
+    if hasproperty(proj, :weight)
+        return getproperty(proj, :weight)
+    elseif hasproperty(proj, :primary) && hasproperty(getproperty(proj, :primary), :weight)
+        return getproperty(getproperty(proj, :primary), :weight)
+    else
+        throw(ArgumentError("Unsupported projection type for kv_cache: $(typeof(proj))"))
+    end
+end
+
 function kv_cache(layer::Attention, len::Int, batch::Int=1)
-    k = similar(layer.wq.weight, layer.head_dim, len, layer.n_kv_heads, batch) .= 0
-    v = similar(layer.wv.weight, layer.head_dim, len, layer.n_kv_heads, batch) .= 0
+    k = similar(_cache_storage(layer.wk), layer.head_dim, len, layer.n_kv_heads, batch) .= 0
+    v = similar(_cache_storage(layer.wv), layer.head_dim, len, layer.n_kv_heads, batch) .= 0
     return KVCache(k, v)
 end
 

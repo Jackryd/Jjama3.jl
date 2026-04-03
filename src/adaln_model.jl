@@ -22,13 +22,14 @@ function AdaConditionalTransformer(
     norm_eps = 1f-5,
     rope_settings = (theta = 500000f0, use_scaled = false, scale_factor = 8),
     head_dim = dim ÷ n_heads,
+    cond_dim::Int = dim,
     kws...
 )
     tok_embeddings = Embedding(vocab_size => dim)
 
     layers = Tuple(
         AdaTransformerBlock(dim, n_heads, n_kv_heads, ff_hidden_dim;
-                              norm_eps = norm_eps, head_dim = head_dim, kws...)
+                              norm_eps = norm_eps, head_dim = head_dim, cond_dim = cond_dim, kws...)
         for _ in 1:n_layers
     )
 

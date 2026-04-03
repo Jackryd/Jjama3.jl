@@ -247,13 +247,14 @@ Flux.@layer AdaTransformerBlock
 
 function AdaTransformerBlock(
     in_dim::Int, n_heads::Int, n_kv_heads::Int = n_heads, ff_hidden_dim::Int = 4 * in_dim;
-    norm_eps = 1f-5, head_dim = in_dim ÷ n_heads, adaln_with_gates::Bool = false, kws...
+    norm_eps = 1f-5, head_dim = in_dim ÷ n_heads, cond_dim::Int = in_dim,
+    adaln_with_gates::Bool = false, kws...
 )
     AdaTransformerBlock(
         Attention(in_dim, n_heads, n_kv_heads; head_dim, kws...),
         FeedForward(in_dim, ff_hidden_dim),
-        AdaLN(in_dim, in_dim; norm_eps = norm_eps, with_gate = adaln_with_gates),
-        AdaLN(in_dim, in_dim; norm_eps = norm_eps, with_gate = adaln_with_gates),
+        AdaLN(in_dim, cond_dim; norm_eps = norm_eps, with_gate = adaln_with_gates),
+        AdaLN(in_dim, cond_dim; norm_eps = norm_eps, with_gate = adaln_with_gates),
     )
 end
 
